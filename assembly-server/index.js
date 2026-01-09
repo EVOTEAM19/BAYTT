@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const ffmpeg = require('fluent-ffmpeg');
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { NodeHttpHandler } = require('@smithy/node-http-handler');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
@@ -13,14 +14,92 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
 // Configurar R2
+// ⚠️ Validar y normalizar el endpoint de R2
+let r2Endpoint = process.env.R2_ENDPOINT;
+
+if (r2Endpoint) {
+  // Remover cualquier prefijo o sufijo incorrecto
+  // El formato correcto es: https://[account-id].r2.cloudflarestorage.com
+  r2Endpoint = r2Endpoint.trim();
+  
+  // ⭐ CORRECCIÓN: Manejar formato incorrecto con ".2." en lugar de ".r2."
+  // Formato incorrecto: https://xxx.2.cloudflarestorage.com
+  // Formato correcto: https://xxx.r2.cloudflarestorage.com
+  if (r2Endpoint.includes('.2.cloudflarestorage.com')) {
+    const accountIdMatch = r2Endpoint.match(/https?:\/\/([a-f0-9]+)\.2\.cloudflarestorage\.com/i);
+    if (accountIdMatch) {
+      const accountId = accountIdMatch[1];
+      r2Endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
+      console.log(`[ASSEMBLY SERVER] ⚠️ Fixed R2 endpoint format (changed .2. to .r2.): ${r2Endpoint}`);
+    }
+  }
+  
+  // Si tiene el formato correcto, validar
+  const correctFormatMatch = r2Endpoint.match(/https?:\/\/([a-f0-9]+)\.r2\.cloudflarestorage\.com/i);
+  if (correctFormatMatch) {
+    const accountId = correctFormatMatch[1];
+    r2Endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
+    console.log(`[ASSEMBLY SERVER] ✅ Normalized R2 endpoint: ${r2Endpoint}`);
+  } else {
+    // Si no coincide el formato, intentar extraer el account ID de cualquier manera
+    const accountIdMatch = r2Endpoint.match(/([a-f0-9]{32})/i);
+    if (accountIdMatch) {
+      const accountId = accountIdMatch[1];
+      r2Endpoint = `https://${accountId}.r2.cloudflarestorage.com`;
+      console.log(`[ASSEMBLY SERVER] ⚠️ Reconstructed R2 endpoint from account ID: ${r2Endpoint}`);
+    } else {
+      console.error(`[ASSEMBLY SERVER] ❌ Invalid R2 endpoint format: ${r2Endpoint}`);
+      console.error(`[ASSEMBLY SERVER] Expected format: https://[account-id].r2.cloudflarestorage.com`);
+      console.error(`[ASSEMBLY SERVER] Common mistake: .2.cloudflarestorage.com should be .r2.cloudflarestorage.com`);
+    }
+  }
+}
+
+// ⭐ CONFIGURACIÓN SSL/TLS CORRECTA PARA R2
+// Cloudflare R2 requiere TLS 1.2 o superior y configuración específica
+// Crear un agente HTTPS con configuración compatible con R2
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  keepAliveMsecs: 1000,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  // ⭐ IMPORTANTE: No especificar secureProtocol en Node.js moderno (18+)
+  // Node.js 18+ usa TLS 1.3 por defecto, que es compatible con R2
+  // Solo especificamos si tenemos problemas de compatibilidad
+  rejectUnauthorized: true,
+  // Timeout aumentado para archivos grandes
+  timeout: 0, // Sin timeout en el agente, se maneja en el requestHandler
+  // Configuración de TLS mínima - Node.js maneja automáticamente TLS 1.2/1.3
+});
+
+// Crear requestHandler con configuración específica
+const requestHandler = new NodeHttpHandler({
+  httpsAgent: httpsAgent,
+  connectionTimeout: 30000, // 30 segundos para establecer conexión
+  socketTimeout: 300000, // 5 minutos para transferencia de datos
+  requestTimeout: 300000 // 5 minutos timeout total de la petición
+});
+
+// ⭐ S3Client con configuración optimizada para R2
 const s3Client = new S3Client({
-  region: 'auto',
-  endpoint: process.env.R2_ENDPOINT,
+  region: 'auto', // R2 usa 'auto' como región
+  endpoint: r2Endpoint,
   credentials: {
     accessKeyId: process.env.R2_ACCESS_KEY_ID,
     secretAccessKey: process.env.R2_SECRET_ACCESS_KEY
-  }
+  },
+  requestHandler: requestHandler,
+  // R2 usa path-style buckets (bucket-name.r2.dev) pero acepta virtual-hosted
+  forcePathStyle: true, // Usar path-style para mejor compatibilidad con R2
+  // Deshabilitar características no soportadas por R2
+  useAccelerateEndpoint: false,
+  useDualstackEndpoint: false
 });
+
+console.log(`[ASSEMBLY SERVER] ✅ S3Client configured for R2`);
+console.log(`[ASSEMBLY SERVER]   - Endpoint: ${r2Endpoint}`);
+console.log(`[ASSEMBLY SERVER]   - Path-style: true`);
+console.log(`[ASSEMBLY SERVER]   - TLS: Auto (Node.js ${process.version})`);
 
 // Directorio temporal
 const TEMP_DIR = process.env.TEMP_DIR || '/tmp/baytt-assembly';
@@ -29,8 +108,9 @@ if (!fs.existsSync(TEMP_DIR)) {
 }
 
 console.log(`[ASSEMBLY SERVER] Temp directory: ${TEMP_DIR}`);
-console.log(`[ASSEMBLY SERVER] R2 Endpoint: ${process.env.R2_ENDPOINT || 'NOT SET'}`);
+console.log(`[ASSEMBLY SERVER] R2 Endpoint (raw): ${process.env.R2_ENDPOINT || 'NOT SET'}`);
 console.log(`[ASSEMBLY SERVER] R2 Bucket: ${process.env.R2_BUCKET_NAME || 'baytt-movies'}`);
+console.log(`[ASSEMBLY SERVER] R2 Public URL: ${process.env.R2_PUBLIC_URL || 'NOT SET'}`);
 
 // Función para descargar archivo con manejo de redirects y headers
 function downloadFile(url, destPath) {
@@ -63,6 +143,15 @@ function downloadFile(url, destPath) {
         req.destroy();
         file.close();
         fs.unlink(destPath, () => {});
+        
+        // ⚠️ Error 401: Token JWT expirado - las URLs de Runway tienen tokens temporales
+        if (response.statusCode === 401) {
+          const errorMsg = `HTTP ${response.statusCode}: Unauthorized - Token JWT expirado. Las URLs de Runway con tokens JWT expiran después de un tiempo. Necesitas copiar los videos a R2 inmediatamente después de generarlos.`;
+          console.error(`[DOWNLOAD] ❌ ${errorMsg}`);
+          reject(new Error(errorMsg));
+          return;
+        }
+        
         reject(new Error(`HTTP ${response.statusCode}: ${response.statusMessage}`));
         return;
       }
@@ -238,8 +327,13 @@ app.post('/assemble', async (req, res) => {
     
     // PASO 5: Subir a R2
     console.log('[ASSEMBLY] STEP 5: Uploading to R2...');
+    console.log(`[ASSEMBLY] R2 Endpoint: ${r2Endpoint || 'NOT SET'}`);
+    console.log(`[ASSEMBLY] R2 Bucket: ${process.env.R2_BUCKET_NAME || 'baytt-movies'}`);
+    console.log(`[ASSEMBLY] R2 Public URL: ${process.env.R2_PUBLIC_URL || 'NOT SET'}`);
+    console.log(`[ASSEMBLY] Node.js version: ${process.version}`);
+    console.log(`[ASSEMBLY] AWS SDK version: ${require('@aws-sdk/client-s3/package.json').version}`);
     
-    if (!process.env.R2_ENDPOINT || !process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) {
+    if (!r2Endpoint || !process.env.R2_ACCESS_KEY_ID || !process.env.R2_SECRET_ACCESS_KEY) {
       throw new Error('R2 configuration missing. Set R2_ENDPOINT, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY');
     }
     
@@ -247,14 +341,39 @@ app.post('/assemble', async (req, res) => {
     const r2Key = `movies/${movie_id}/final.mp4`;
     const bucketName = process.env.R2_BUCKET_NAME || 'baytt-movies';
     
+    console.log(`[ASSEMBLY] ==========================================`);
+    console.log(`[ASSEMBLY] Upload configuration:`);
+    console.log(`[ASSEMBLY]   - Bucket: ${bucketName}`);
+    console.log(`[ASSEMBLY]   - Key: ${r2Key}`);
+    console.log(`[ASSEMBLY]   - File size: ${(fileContent.length / 1024 / 1024).toFixed(2)} MB`);
+    console.log(`[ASSEMBLY]   - Endpoint: ${r2Endpoint}`);
+    console.log(`[ASSEMBLY]   - Has credentials: ${!!(process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY)}`);
+    console.log(`[ASSEMBLY] ==========================================`);
+    
     try {
-      await s3Client.send(new PutObjectCommand({
+      console.log(`[ASSEMBLY] Starting upload to R2...`);
+      
+      // Usar stream en lugar de Buffer completo para archivos grandes
+      // Esto puede ayudar con problemas SSL/TLS en archivos grandes
+      const uploadCommand = new PutObjectCommand({
         Bucket: bucketName,
         Key: r2Key,
         Body: fileContent,
         ContentType: 'video/mp4',
-        CacheControl: 'public, max-age=31536000'
-      }));
+        CacheControl: 'public, max-age=31536000',
+        // Metadata adicional
+        Metadata: {
+          'movie-id': movie_id,
+          'upload-date': new Date().toISOString(),
+          'source': 'baytt-assembly-server'
+        }
+      });
+      
+      const uploadStartTime = Date.now();
+      await s3Client.send(uploadCommand);
+      const uploadElapsed = ((Date.now() - uploadStartTime) / 1000).toFixed(2);
+      
+      console.log(`[ASSEMBLY] ✅ Upload to R2 completed in ${uploadElapsed}s`);
       
       // Construir URL pública
       let publicUrl;
@@ -262,18 +381,17 @@ app.post('/assemble', async (req, res) => {
         // Si hay un dominio personalizado o URL pública configurada
         const baseUrl = process.env.R2_PUBLIC_URL.replace(/\/$/, '');
         publicUrl = `${baseUrl}/${r2Key}`;
-      } else if (process.env.R2_ENDPOINT) {
-        // Intentar construir URL pública desde el endpoint
-        // Formato: https://xxx.r2.cloudflarestorage.com -> https://pub-xxx.r2.dev
-        const endpointMatch = process.env.R2_ENDPOINT.match(/https?:\/\/([^.]+)\./);
+        console.log(`[ASSEMBLY] Using R2_PUBLIC_URL: ${publicUrl}`);
+      } else if (r2Endpoint) {
+        // Intentar construir URL pública desde el endpoint normalizado
+        // Formato: https://[account-id].r2.cloudflarestorage.com -> https://pub-[account-id].r2.dev
+        const endpointMatch = r2Endpoint.match(/https?:\/\/([a-f0-9]+)\.r2\.cloudflarestorage\.com/i);
         if (endpointMatch && endpointMatch[1]) {
           const accountId = endpointMatch[1];
           publicUrl = `https://pub-${accountId}.r2.dev/${r2Key}`;
+          console.log(`[ASSEMBLY] Constructed public URL from endpoint: ${publicUrl}`);
         } else {
-          // Fallback: usar el endpoint directamente (puede no funcionar)
-          publicUrl = `${process.env.R2_ENDPOINT.replace('/r2.cloudflarestorage.com', '')}/${r2Key}`;
-          console.warn(`[ASSEMBLY] ⚠️ Could not parse R2 endpoint, using fallback URL: ${publicUrl}`);
-          console.warn(`[ASSEMBLY] ⚠️ Consider setting R2_PUBLIC_URL explicitly for reliable URLs`);
+          throw new Error(`Cannot parse R2 endpoint to construct public URL. Endpoint: ${r2Endpoint}. Please set R2_PUBLIC_URL explicitly.`);
         }
       } else {
         throw new Error('Cannot construct public URL. Set R2_PUBLIC_URL environment variable');
@@ -310,7 +428,33 @@ app.post('/assemble', async (req, res) => {
       });
       
     } catch (uploadError) {
-      console.error('[ASSEMBLY] ❌ R2 upload error:', uploadError.message);
+      console.error('[ASSEMBLY] ==========================================');
+      console.error('[ASSEMBLY] ❌ R2 upload error occurred');
+      console.error('[ASSEMBLY] Error message:', uploadError.message);
+      console.error('[ASSEMBLY] Error name:', uploadError.name);
+      console.error('[ASSEMBLY] Error code:', uploadError.code);
+      
+      // Información adicional para diagnóstico
+      if (uploadError.stack) {
+        console.error('[ASSEMBLY] Stack trace:', uploadError.stack);
+      }
+      
+      // Verificar si es un error SSL/TLS específico
+      if (uploadError.message.includes('SSL') || 
+          uploadError.message.includes('TLS') || 
+          uploadError.message.includes('handshake') ||
+          uploadError.message.includes('EPROTO')) {
+        console.error('[ASSEMBLY] ⚠️ SSL/TLS error detected');
+        console.error('[ASSEMBLY] Possible causes:');
+        console.error('[ASSEMBLY]   1. Node.js version incompatible (< 18.0.0)');
+        console.error('[ASSEMBLY]   2. R2 endpoint format incorrect');
+        console.error('[ASSEMBLY]   3. Network/firewall blocking TLS connection');
+        console.error('[ASSEMBLY]   4. Certificate validation issue');
+        console.error('[ASSEMBLY] Current Node.js version:', process.version);
+        console.error('[ASSEMBLY] R2 Endpoint:', r2Endpoint);
+      }
+      
+      console.error('[ASSEMBLY] ==========================================');
       throw new Error(`R2 upload failed: ${uploadError.message}`);
     }
     
